@@ -1,5 +1,7 @@
 streamlit
 openai-whisper
+faster-whisper
+whisperx
 yt-dlp
 pydub
 
@@ -27,3 +29,5 @@ numpy
 pandas
 requests
 python-dotenv
+
+rank_bm25
