@@ -10,9 +10,10 @@ from core.summarize import summarize, generate_title
 from core.extractor import (
     extract_action_items,
     extract_key_decisions,
-    extract_questions
+    extract_questions,
+    extract_chapters,
 )
-from core.rag_engine import build_rag_chain, ask_question
+from core.rag_engine import build_rag_chain, ask_question, ask_question_with_citations
 load_dotenv()
 
 # ─── Page Config ────────────────────────────────────────────────────────────────
@@ -335,6 +336,65 @@ def render_step_bar(label: str, key: str, icon: str):
         <span>{icon} {label}</span>
     </div>""", unsafe_allow_html=True)
 
+
+def _fmt_ts(seconds: float) -> str:
+    """Convert float seconds → MM:SS string."""
+    try:
+        total = int(seconds)
+        return f"{total // 60:02d}:{total % 60:02d}"
+    except Exception:
+        return "00:00"
+
+
+def _ch_info(ch) -> tuple[str, str]:
+    """Safely extract (formatted_timestamp, title) from a Chapter object or dict."""
+    if hasattr(ch, "start_time"):
+        return _fmt_ts(ch.start_time), getattr(ch, "title", "")
+    if hasattr(ch, "start_timestamp"):
+        return _fmt_ts(ch.start_timestamp), getattr(ch, "title", "")
+    if isinstance(ch, dict):
+        return _fmt_ts(ch.get("start_timestamp", ch.get("start_time", 0))), ch.get("title", "")
+    return "00:00", str(ch)
+
+
+def _build_markdown_export(r: dict) -> str:
+    """Build a full Markdown export string from the result dict."""
+    lines = []
+    lines.append(f"# {r.get('title', 'Meeting')}\n")
+
+    lines.append("## Summary\n")
+    lines.append(r.get("summary", "") + "\n")
+
+    # Chapters
+    chapters = r.get("chapters", [])
+    if chapters:
+        lines.append("## 🕐 Chapters\n")
+        for ch in chapters:
+            ts, title = _ch_info(ch)
+            lines.append(f"- **[{ts}]** {title}")
+        lines.append("")
+
+    # Action Items
+    lines.append("## ✅ Action Items\n")
+    lines.append(r.get("action_items", "") + "\n")
+
+    # Key Decisions
+    lines.append("## 🔑 Key Decisions\n")
+    lines.append(r.get("key_decisions", "") + "\n")
+
+    # Open Questions
+    lines.append("## ❓ Open Questions\n")
+    lines.append(r.get("open_questions", "") + "\n")
+
+    # Full Transcript
+    lines.append("## 📝 Full Transcript\n")
+    lines.append("```")
+    lines.append(r.get("transcript", ""))
+    lines.append("```")
+
+    return "\n".join(lines)
+
+
 # ─── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<div class="hero-title" style="font-size:1.6rem">🎬 AI<br>Video</div>', unsafe_allow_html=True)
@@ -349,7 +409,8 @@ with st.sidebar:
         type=["mp4", "mp3", "wav", "m4a", "mkv", "webm"],
     )
 
-    language = st.selectbox("Language", ["english", "hinglish"], index=0)
+    # Language selectbox — "auto" is now the default (index=0)
+    language = st.selectbox("Language", ["auto", "english", "hinglish"], index=0)
 
     run_btn = st.button("⚡  Analyse", use_container_width=True)
 
@@ -362,6 +423,7 @@ with st.sidebar:
             ("title",      "🏷️", "Title Generation"),
             ("summary",    "📋", "Summarisation"),
             ("extract",    "🔍", "Extraction"),
+            ("chapters",   "🕐", "Chapters"),
             ("rag",        "🧠", "RAG Engine"),
         ]:
             render_step_bar(label, step, icon)
@@ -399,40 +461,58 @@ if run_btn:
             else:
                 input_path = source.strip()
 
+            # ── Step 1: Audio ────────────────────────────────────────────────
             update_step("audio", "active")
-            chunks = process_input_audio(input_path)
+            # process_input_audio now returns (chunks, full_wav_path)
+            chunks, full_wav_path = process_input_audio(input_path)
             update_step("audio", "done")
 
+            # ── Step 2: Transcription ────────────────────────────────────────
             update_step("transcript", "active")
-            transcript = transcribe_all(chunks, language)
+            # transcribe_all now returns (transcript_str, segments_list)
+            transcript, segments = transcribe_all(chunks, language)
             update_step("transcript", "done")
 
+            # ── Step 3: Title ────────────────────────────────────────────────
             update_step("title", "active")
             title = generate_title(transcript)
             update_step("title", "done")
 
+            # ── Step 4: Summary ──────────────────────────────────────────────
             update_step("summary", "active")
             summary = summarize(transcript)
             update_step("summary", "done")
 
+            # ── Step 5: Extraction ───────────────────────────────────────────
             update_step("extract", "active")
-            action_items  = extract_action_items(transcript)
-            decisions     = extract_key_decisions(transcript)
-            questions     = extract_questions(transcript)
+            # Each extractor now returns (display_str, pydantic_list)
+            action_items_str, action_items_data   = extract_action_items(transcript, segments)
+            decisions_str,    decisions_data       = extract_key_decisions(transcript, segments)
+            questions_str,    questions_data       = extract_questions(transcript, segments)
             update_step("extract", "done")
 
+            # ── Step 6: Chapters ─────────────────────────────────────────────
+            update_step("chapters", "active")
+            # extract_chapters returns list[Chapter]
+            chapters = extract_chapters(transcript, segments)
+            update_step("chapters", "done")
+
+            # ── Step 7: RAG Engine ───────────────────────────────────────────
             update_step("rag", "active")
-            rag_chain = build_rag_chain(transcript)
+            # build_rag_chain now accepts segments for speaker-aware retrieval
+            rag_chain = build_rag_chain(transcript, segments)
             update_step("rag", "done")
 
             st.session_state.result = {
-                "title": title,
-                "transcript": transcript,
-                "summary": summary,
-                "action_items": action_items,
-                "key_decisions": decisions,
-                "open_questions": questions,
-                "rag_chain": rag_chain,
+                "title":        title,
+                "transcript":   transcript,
+                "segments":     segments,
+                "summary":      summary,
+                "action_items": action_items_str,
+                "key_decisions": decisions_str,
+                "open_questions": questions_str,
+                "chapters":     chapters,
+                "rag_chain":    rag_chain,
             }
             st.session_state.pipeline_done = True
             progress_placeholder.success("✅ Analysis complete!")
@@ -441,7 +521,7 @@ if run_btn:
             st.rerun()
 
         except Exception as e:
-            for k in ["audio","transcript","title","summary","extract","rag"]:
+            for k in ["audio", "transcript", "title", "summary", "extract", "chapters", "rag"]:
                 if st.session_state.pipeline_steps.get(k) == "active":
                     st.session_state.pipeline_steps[k] = "pending"
             progress_placeholder.error(f"❌ Error: {e}")
@@ -459,6 +539,16 @@ if st.session_state.result:
         </div>
     </div>""", unsafe_allow_html=True)
 
+    # Export Markdown button
+    md_content = _build_markdown_export(r)
+    safe_title = r.get("title", "meeting").replace(" ", "_").replace("/", "-")[:50]
+    st.download_button(
+        label="📄 Export Markdown",
+        data=md_content.encode("utf-8"),
+        file_name=f"{safe_title}.md",
+        mime="text/markdown",
+    )
+
     # Top row: summary + transcript
     col1, col2 = st.columns([3, 2], gap="medium")
 
@@ -472,6 +562,25 @@ if st.session_state.result:
     with col2:
         with st.expander("📝 Full Transcript", expanded=False):
             st.markdown(f'<div class="transcript-box">{r["transcript"]}</div>', unsafe_allow_html=True)
+
+    # ── Chapters card ────────────────────────────────────────────────────────
+    chapters = r.get("chapters", [])
+    if chapters:
+        chapters_html = ""
+        for ch in chapters:
+            ts, ch_title = _ch_info(ch)
+            chapters_html += (
+                f'<div style="display:flex;align-items:baseline;gap:0.75rem;'
+                f'margin-bottom:0.5rem">'
+                f'<span class="badge badge-cyan">{ts}</span>'
+                f'<span style="font-size:0.875rem">{ch_title}</span>'
+                f'</div>'
+            )
+        st.markdown(f"""
+        <div class="card">
+            <div class="card-title">🕐 Chapters</div>
+            <div class="card-content">{chapters_html}</div>
+        </div>""", unsafe_allow_html=True)
 
     # Second row: action items | decisions | questions
     c1, c2, c3 = st.columns(3, gap="medium")
@@ -518,6 +627,23 @@ if st.session_state.result:
                     <span class="chat-label bot-label">🤖 Assistant</span>
                     <div class="chat-bubble bot-bubble">{msg['content']}</div>
                 </div>"""
+                # Show cited sources if available
+                if msg.get("sources"):
+                    chat_html += '<div style="margin-left:0.5rem;margin-top:-0.5rem;margin-bottom:0.75rem">'
+                    chat_html += '<details><summary style="font-size:0.7rem;color:var(--text-muted);cursor:pointer">📎 Sources</summary>'
+                    chat_html += '<div style="margin-top:0.4rem">'
+                    for src in msg["sources"]:
+                        spk = src.get("speaker", "")
+                        start = _fmt_ts(src.get("start", 0))
+                        text = src.get("text", "")[:120]
+                        label = f"[{spk} @ {start}]" if spk else f"[@ {start}]"
+                        chat_html += (
+                            f'<div style="font-size:0.72rem;color:var(--text-muted);'
+                            f'margin-bottom:0.25rem;padding:0.3rem 0.6rem;'
+                            f'background:var(--surface-2);border-radius:4px">'
+                            f'<strong>{label}</strong>: {text}…</div>'
+                        )
+                    chat_html += '</div></details></div>'
         chat_html += '</div>'
         st.markdown(chat_html, unsafe_allow_html=True)
     else:
@@ -536,9 +662,18 @@ if st.session_state.result:
 
     if send_btn and user_input.strip():
         with st.spinner("Thinking…"):
-            answer = ask_question(r["rag_chain"], user_input.strip())
+            try:
+                # Use citation-aware answer if available
+                result_dict = ask_question_with_citations(r["rag_chain"], user_input.strip())
+                answer  = result_dict["answer"]
+                sources = result_dict.get("sources", [])
+            except Exception:
+                # Fallback to plain ask_question
+                answer  = ask_question(r["rag_chain"], user_input.strip())
+                sources = []
+
         st.session_state.chat_history.append({"role": "user",      "content": user_input.strip()})
-        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+        st.session_state.chat_history.append({"role": "assistant", "content": answer, "sources": sources})
         st.rerun()
 
     if st.session_state.chat_history:
